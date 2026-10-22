@@ -1,70 +1,63 @@
-"""Owner-only auth: bcrypt hashes, JWT in an httpOnly cookie, password-version revocation."""
+from fastapi import APIRouter, Depends, HTTPException, Response
 
-import os
-import time
-
-import bcrypt
-import jwt
-from fastapi import HTTPException, Request, Response
-
+from lib.auth import (
+    check_throttle, clear_failures, clear_session, current_user, hash_pw, record_failure, set_session, verify_pw,
+)
+from lib.core import audit, now
 from lib.db import db
+from models.schemas import ChangePasswordIn, LoginIn, ProfileIn, UserOut
 
-COOKIE = "lia_session"
-SECRET = os.environ["JWT_SECRET"]
-MAX_AGE = 7 * 24 * 3600
-
-_failures: dict[str, list[float]] = {}
+router = APIRouter(prefix="/auth")
 
 
-def hash_pw(password: str) -> str:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+def user_out(u: dict) -> UserOut:
+    return UserOut(id=u["id"], email=u["email"], name=u["name"], role=u["role"])
 
 
-def verify_pw(password: str, hashed: str) -> bool:
-    try:
-        return bcrypt.checkpw(password.encode(), hashed.encode())
-    except ValueError:
-        return False
+@router.post("/login", response_model=UserOut)
+async def login(body: LoginIn, response: Response):
+    email = body.email.strip().lower()
+    check_throttle(email)
+    user = await db.users.find_one({"email": email, "role": "owner"}, {"_id": 0})
+    if not user or not verify_pw(body.password, user["password_hash"]):
+        record_failure(email)
+        raise HTTPException(401, "Email atau kata sandi salah")
+    clear_failures(email)
+    set_session(response, user)
+    await audit(user, "login", "users", user["id"])
+    return user_out(user)
 
 
-def check_throttle(key: str) -> None:
-    window = time.time() - 15 * 60
-    recent = [t for t in _failures.get(key, []) if t > window]
-    _failures[key] = recent
-    if len(recent) >= 5:
-        raise HTTPException(429, "Terlalu banyak percobaan login. Coba lagi dalam 15 menit.")
+@router.post("/logout")
+async def logout(response: Response):
+    clear_session(response)
+    return {"ok": True}
 
 
-def record_failure(key: str) -> None:
-    _failures.setdefault(key, []).append(time.time())
+@router.get("/me", response_model=UserOut)
+async def me(user: dict = Depends(current_user)):
+    return user_out(user)
 
 
-def clear_failures(key: str) -> None:
-    _failures.pop(key, None)
+@router.put("/profile", response_model=UserOut)
+async def update_profile(body: ProfileIn, user: dict = Depends(current_user)):
+    email = body.email.strip().lower()
+    clash = await db.users.find_one({"email": email, "id": {"$ne": user["id"]}})
+    if clash:
+        raise HTTPException(409, "Email sudah digunakan")
+    await db.users.update_one({"id": user["id"]}, {"$set": {"email": email, "name": body.name, "updated_at": now()}})
+    await audit(user, "ubah_profil", "users", user["id"], f"email={email}")
+    return user_out({**user, "email": email, "name": body.name})
 
 
-def set_session(response: Response, user: dict) -> None:
-    token = jwt.encode(
-        {"sub": user["id"], "pwv": user.get("pw_version", 1), "exp": int(time.time()) + MAX_AGE},
-        SECRET,
-        algorithm="HS256",
+@router.post("/change-password")
+async def change_password(body: ChangePasswordIn, response: Response, user: dict = Depends(current_user)):
+    if not verify_pw(body.current_password, user["password_hash"]):
+        raise HTTPException(400, "Kata sandi saat ini salah")
+    pwv = user.get("pw_version", 1) + 1
+    await db.users.update_one(
+        {"id": user["id"]}, {"$set": {"password_hash": hash_pw(body.new_password), "pw_version": pwv, "updated_at": now()}}
     )
-    response.set_cookie(COOKIE, token, httponly=True, samesite="lax", secure=False, max_age=MAX_AGE, path="/")
-
-
-def clear_session(response: Response) -> None:
-    response.delete_cookie(COOKIE, path="/")
-
-
-async def current_user(request: Request) -> dict:
-    token = request.cookies.get(COOKIE)
-    if not token:
-        raise HTTPException(401, "Silakan login terlebih dahulu")
-    try:
-        payload = jwt.decode(token, SECRET, algorithms=["HS256"])
-    except jwt.PyJWTError:
-        raise HTTPException(401, "Sesi tidak valid atau kedaluwarsa")
-    user = await db.users.find_one({"id": payload.get("sub"), "role": "owner"}, {"_id": 0})
-    if not user or user.get("pw_version", 1) != payload.get("pwv"):
-        raise HTTPException(401, "Sesi tidak valid atau kedaluwarsa")
-    return user
+    set_session(response, {**user, "pw_version": pwv})  # other devices are signed out
+    await audit(user, "ubah_sandi", "users", user["id"])
+    return {"ok": True}
